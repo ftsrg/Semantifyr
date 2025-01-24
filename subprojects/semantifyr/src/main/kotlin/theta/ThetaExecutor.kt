@@ -36,6 +36,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.io.path.absolute
 import kotlin.time.toDuration
 import kotlin.time.toDurationUnit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class ThetaRuntimeDetails(
     val id: Int,
@@ -44,25 +46,70 @@ class ThetaRuntimeDetails(
 ) {
     val modelFile = "$name.xsts"
     val cexFile = "$name$id.cex"
+    val cexsFile = "$name.cexs"
     val logFile = "theta$id.out"
     val errFile = "theta$id.err"
 
     val modelPath = "$workingDirectory${File.separator}$modelFile"
-    val cexPath = "$workingDirectory${File.separator}$cexFile"
+    // Theta can produce several kinds of output files, even images
+    // it's probably a good idea to group all of those under here
+    val outputPath = "$workingDirectory${File.separator}theta-traces"
+
+    val cexPath = "$outputPath${File.separator}$cexFile"
+    val cexsPath = "$outputPath${File.separator}$cexsFile"
     val logPath = "$workingDirectory${File.separator}$logFile"
     val errPath = "$workingDirectory${File.separator}$errFile"
 
     val isUnsafe: Boolean by lazy {
-        Files.exists(Paths.get(cexPath))
+        val filePath = Paths.get(logPath)
+        if (Files.exists(filePath)) {
+            Files.lines(filePath).use { lines ->
+                lines.anyMatch { it.contains("SafetyResult Unsafe") }
+            }
+        } else {
+            false
+        }
     }
 }
 
-class ThetaExecutor(
+abstract class ThetaExecutor {
+    abstract fun run(workingDirectory: String, name: String) : ThetaRuntimeDetails
+
+    // Some Theta parameters are only important to Theta (e.g., what abstraction to use),
+    // but some are important here as well, such as if the output is a single or several .cex files, or .cexs files, etc. (see TRACEGEN).
+    // To keep the different executors uniform, they should use this helper function to get their Theta parameters.
+    fun getParameters(parameter: String, thetaRuntimeDetails: ThetaRuntimeDetails, docker: Boolean = false): Array<String> {
+        val params = parameter.split(" ").toTypedArray()
+        val outputFlag = if(parameter.contains("TRACEGEN")) {
+            if(docker) {
+                "--trace-dir " + "/host/${File(thetaRuntimeDetails.cexsPath).parent}"
+            } else {
+                "--trace-dir " + File(thetaRuntimeDetails.cexsPath).parent
+            }
+        } else {
+            if(docker) {
+                // Mainline Theta will not create the folder and will concatenate absolute paths incorrectly here
+                // TODO will add fix in PR later to properly support output directories and absolute paths
+                "--cexfile " + "/host/${File(thetaRuntimeDetails.outputPath).name}${File.separator}${thetaRuntimeDetails.cexFile}"
+            } else {
+                "--cexfile " + "${File(thetaRuntimeDetails.outputPath).name}${File.separator}${thetaRuntimeDetails.cexFile}"
+            }
+        }
+        val modelFlag = if(docker) {
+            "--model " + "/host/${thetaRuntimeDetails.modelFile}"
+        } else {
+            "--model " + thetaRuntimeDetails.modelFile
+        }
+            return (params + outputFlag + modelFlag).joinToString(" ").split(" ").toTypedArray()
+    }
+}
+
+class ThetaDockerExecutor(
     private val version: String,
     private val parameters: List<String>,
     private val timeout: Long = 3,
     private val timeUnit: TimeUnit = TimeUnit.MINUTES
-) {
+) : ThetaExecutor() {
 
     private val logger by loggerFactory()
 
@@ -116,7 +163,7 @@ class ThetaExecutor(
             logger.info("Theta finished ($id)")
         } else {
             logger.error("Theta failed ($id)")
-            throw IllegalStateException("Theta execution failed with code ${result.statusCode}. See $thetaRuntimeDetails")
+            throw IllegalStateException("Theta execution failed with code ${result.statusCode}. See ${thetaRuntimeDetails.errPath} (and .out) files")
         }
 
         return thetaRuntimeDetails
@@ -148,12 +195,11 @@ class ThetaExecutor(
         val hostConfig = HostConfig.newHostConfig()
             .withBinds(Bind(thetaRuntimeDetails.workingDirectory, Volume("/host")))
 
+        val param = super.getParameters(parameter, thetaRuntimeDetails, true)
+
         val container = dockerClient.createContainerCmd("ftsrg/theta-xsts-cli:$version")
             .withCmd(
-                "CEGAR",
-                "--model", "/host/${thetaRuntimeDetails.modelFile}",
-                "--cexfile", "/host/${thetaRuntimeDetails.cexFile}",
-                *parameter.split(" ").toTypedArray(),
+                *param
             )
             .withHostConfig(hostConfig)
             .exec()
@@ -179,10 +225,119 @@ class ThetaExecutor(
         }
     }
 
+    override
     fun run(workingDirectory: String, name: String) = runBlocking {
         val absoluteDirectory = Path.of(workingDirectory).absolute().toString()
 
         runWorkflow(absoluteDirectory, name)
     }
 
+}
+
+class ThetaShellExecutor(
+    private val shPath: String,
+    private val parameters: List<String>,
+    private val timeout: Long = 3,
+    private val timeUnit: TimeUnit = TimeUnit.MINUTES
+) : ThetaExecutor() {
+
+    private val logger by loggerFactory()
+    private val mutex = Mutex()
+
+    init {
+        if (System.getProperty("os.name").contains("Windows", ignoreCase = true)) {
+            throw UnsupportedOperationException("ThetaShellExecutor does not support Windows for now")
+        }
+    }
+
+    private suspend fun runTheta(
+        workingDirectory: String,
+        name: String,
+        parameter: String,
+        id: Int
+    ): ThetaRuntimeDetails {
+        logger.info("Starting theta ($id)")
+
+        val thetaRuntimeDetails = ThetaRuntimeDetails(id, workingDirectory, name)
+
+        val param = super.getParameters(parameter, thetaRuntimeDetails, false)
+
+        val processBuilder = ProcessBuilder(
+            shPath,
+            *param
+        )
+        processBuilder.directory(File(workingDirectory))
+
+        val process = try {
+            withTimeout(timeout.toDuration(timeUnit.toDurationUnit())) {
+                mutex.withLock {
+                    processBuilder.start()
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            logger.info("Theta timed out ($id)")
+            throw e
+        } catch (e: Exception) {
+            logger.error("Theta execution failed ($id)", e)
+            throw e
+        }
+
+        val exitCode = try {
+            withTimeout(timeout.toDuration(timeUnit.toDurationUnit())) {
+                process.waitFor()
+            }
+        } catch (e: TimeoutCancellationException) {
+            logger.info("Theta timed out ($id)")
+            process.destroy()
+            throw e
+        } finally {
+            saveProcessLogs(thetaRuntimeDetails, process)
+        }
+
+        if (exitCode == 0) {
+            logger.info("Theta finished ($id)")
+        } else {
+            logger.error("Theta failed ($id) with code $exitCode")
+            throw IllegalStateException("Theta execution failed with code $exitCode. See ${thetaRuntimeDetails.errPath} (and .out) files")
+        }
+
+        return thetaRuntimeDetails
+    }
+
+    private fun saveProcessLogs(thetaRuntimeDetails: ThetaRuntimeDetails, process: Process) {
+        try {
+            val logFile = File(thetaRuntimeDetails.logPath)
+            val errFile = File(thetaRuntimeDetails.errPath)
+
+            process.inputStream.bufferedReader().use { logFile.writeText(it.readText()) }
+            process.errorStream.bufferedReader().use { errFile.writeText(it.readText()) }
+        } catch (e: Exception) {
+            logger.error("Exception during saving logging details (${thetaRuntimeDetails.id})", e)
+        }
+    }
+
+    private suspend fun runWorkflow(workingDirectory: String, name: String) = supervisorScope {
+        val jobs = parameters.indices.map { index ->
+            async(Dispatchers.IO) {
+                runTheta(workingDirectory, name, parameters[index], index)
+            }
+        }
+
+        try {
+            logger.debug("Awaiting jobs")
+            jobs.awaitAny()
+        } finally {
+            logger.debug("Canceling jobs")
+            jobs.forEach {
+                it.cancelAndJoin()
+            }
+        }
+    }
+
+    override
+    fun run(workingDirectory: String, name: String) = runBlocking {
+        val absoluteDirectory = Path.of(workingDirectory).absolute().toString()
+
+        runWorkflow(absoluteDirectory, name)
+    }
 }

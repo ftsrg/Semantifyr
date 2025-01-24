@@ -9,7 +9,7 @@ package hu.bme.mit.semantifyr.oxsts.semantifyr
 import hu.bme.mit.semantifyr.oxsts.model.oxsts.Target
 import hu.bme.mit.semantifyr.oxsts.semantifyr.reader.OxstsReader
 import hu.bme.mit.semantifyr.oxsts.semantifyr.serialization.XstsSerializer
-import hu.bme.mit.semantifyr.oxsts.semantifyr.theta.ThetaExecutor
+import hu.bme.mit.semantifyr.oxsts.semantifyr.theta.ThetaDockerExecutor
 import hu.bme.mit.semantifyr.oxsts.semantifyr.transformation.XstsTransformer
 import hu.bme.mit.semantifyr.oxsts.semantifyr.utils.EnvVar
 import hu.bme.mit.semantifyr.oxsts.semantifyr.utils.loggerFactory
@@ -35,13 +35,13 @@ open class VerificationTest {
     companion object {
         val thetaVersion by EnvVar()
 
-        val thetaExecutor = ThetaExecutor(
+        val thetaDockerExecutor = ThetaDockerExecutor(
             thetaVersion,
             listOf(
-                "--domain EXPL --refinement SEQ_ITP --maxenum 250 --initprec CTRL --stacktrace",
-                "--domain EXPL_PRED_COMBINED --autoexpl NEWOPERANDS --initprec CTRL --stacktrace",
-                "--domain PRED_CART --refinement SEQ_ITP --stacktrace",
-                "--stacktrace",
+                "CEGAR --domain EXPL --refinement SEQ_ITP --maxenum 250 --initprec CTRL --stacktrace",
+                "CEGAR --domain EXPL_PRED_COMBINED --autoexpl NEWOPERANDS --initprec CTRL --stacktrace",
+                "CEGAR --domain PRED_CART --refinement SEQ_ITP --stacktrace",
+                "CEGAR --stacktrace",
             ),
         )
 
@@ -87,7 +87,7 @@ open class VerificationTest {
 
         logger.info("Executing theta on $modelPath")
 
-        val result = thetaExecutor.run(targetDirectory, targetName)
+        val result = thetaDockerExecutor.run(targetDirectory, targetName)
 
         logger.info("Checking results of Theta")
 

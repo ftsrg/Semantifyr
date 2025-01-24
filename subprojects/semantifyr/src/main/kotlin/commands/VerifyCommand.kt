@@ -1,8 +1,11 @@
 package hu.bme.mit.semantifyr.oxsts.semantifyr.commands
 
 import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.options.optionalValue
+import com.github.ajalt.clikt.parameters.options.optionalValueLazy
 import com.github.ajalt.clikt.parameters.types.file
 import hu.bme.mit.semantifyr.oxsts.semantifyr.reader.OxstsReader
 import hu.bme.mit.semantifyr.oxsts.semantifyr.reader.prepareOxsts
@@ -20,6 +23,7 @@ class VerifyCommand : BaseVerifyCommand("verify") {
 
     override val logger by loggerFactory()
 
+    val thetaStartScript by option("--theta-start-sh").default("")
     val libraryDirectory by argument().file(mustExist = true, canBeDir = true)
     val targetName by argument()
     val generateWitness by option("-w", "--witness").flag()
@@ -47,10 +51,15 @@ class VerifyCommand : BaseVerifyCommand("verify") {
 
         logger.info("Producing xsts file to $output")
 
-        val result = runVerification(output)
+        val result = runVerification(output, thetaStartScript)
 
-        if (generateWitness && result.isUnsafe) {
+        if (generateWitness && result.isUnsafe && File(result.cexPath).exists()) {
             generateWitness(result, reader)
+        }
+
+        // in case of tracegen generating .cexs, safety of result does not matter
+        if (generateWitness && File(result.cexsPath).exists()) {
+            generateSummaryWitness(result, reader)
         }
     }
 
@@ -76,4 +85,25 @@ class VerifyCommand : BaseVerifyCommand("verify") {
         logger.info("Saved witness to $witnessPath")
     }
 
+    private fun generateSummaryWitness(
+        result: ThetaRuntimeDetails,
+        reader: OxstsReader
+    ) {
+        logger.info("Generating witness from ${result.cexsPath}")
+
+        prepareCex()
+
+        val cexReader = CexReader()
+        val cex = cexReader.readCexFile(File(result.cexsPath))
+
+        val witnessCreator = WitnessCreator(reader)
+
+        val witnessPath = model.path.replace(".oxsts", ".cexs.oxsts")
+        val resource = reader.resourceSet.createResource(URI.createFileURI(witnessPath))
+        resource.contents += witnessCreator.createWitness(targetName, cex)
+
+        resource.save(null)
+
+        logger.info("Saved witness to $witnessPath")
+    }
 }
